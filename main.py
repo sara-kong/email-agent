@@ -1,141 +1,341 @@
-import os
-import pickle
-from dotenv import load_dotenv
-from openai import OpenAI
-from googleapiclient.discovery import build
-from google_auth_oauthlib.flow import InstalledAppFlow
+import json
+from gmail_utils import get_gmail_service, fetch_emails
+from classifier import classify_email
+from responder import generate_reply
+from draft_creator import create_draft
+from summarizer import summarize_thread
+from embeddings import create_embedding
 
-# ----------------------------
-# ENV + OPENAI
-# ----------------------------
-load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+from memory import (
+    save_email,
+    email_exists,
+    save_contact,
+    get_thread_summary,
+    save_thread_summary,
+    semantic_search,
+    get_recent_emails_from_sender,
+    update_sender,
+    cursor
+)
 
-# ----------------------------
-# GMAIL AUTH
-# ----------------------------
-SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/gmail.compose"
-]
-def gmail_auth():
-    creds = None
 
-    if os.path.exists("token.pickle"):
-        with open("token.pickle", "rb") as token:
-            creds = pickle.load(token)
+def main():
 
-    if not creds:
-        flow = InstalledAppFlow.from_client_secrets_file(
-            "credentials.json",
-            SCOPES
-        )
-        creds = flow.run_local_server(port=0)
+    # ==============================
+    # GMAIL AUTH
+    # ==============================
 
-        with open("token.pickle", "wb") as token:
-            pickle.dump(creds, token)
+    service = get_gmail_service()
 
-    return build("gmail", "v1", credentials=creds)
+    # ==============================
+    # FETCH EMAILS
+    # ==============================
 
-# ----------------------------
-# AI REPLY GENERATOR
-# ----------------------------
-def generate_email_reply(email_text):
-    response = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[
-            {
-                "role": "system",
-                "content": "You write concise, natural email replies."
-            },
-            {
-                "role": "user",
-                "content": f"Write a reply to this email:\n\n{email_text}"
-            }
-        ]
+    emails, _ = fetch_emails(
+        service,
+        max_results=3
     )
 
-    return response.choices[0].message.content
+    print(f"Fetched {len(emails)} emails")
 
-# ----------------------------
-# CREATE GMAIL DRAFT
-# ----------------------------
-def create_draft(service, to_email, subject, body):
-    message = {
-        "message": {
-            "raw": base64_encode_email(to_email, subject, body)
-        }
-    }
+    # ==============================
+    # MAIN LOOP
+    # ==============================
 
-    service.users().drafts().create(
-        userId="me",
-        body=message
-    ).execute()
+    for email in emails:
 
-# Gmail requires base64 encoded raw email format
-import base64
-def base64_encode_email(to, subject, body):
-    email_text = f"""To: {to}
-Subject: Re: {subject}
-Content-Type: text/plain; charset="UTF-8"
+        gmail_id = email["id"]
 
-{body}
-"""
+        # ==============================
+        # DEDUP CHECK
+        # ==============================
 
-    encoded = base64.urlsafe_b64encode(email_text.encode("utf-8")).decode("utf-8")
-    return encoded
+        if email_exists(gmail_id):
 
-# ----------------------------
-# PROCESS EMAILS → AI → DRAFTS
-# ----------------------------
-def process_emails(service):
-    results = service.users().messages().list(
-        userId="me",
-        maxResults=5
-    ).execute()
+            print("⏭ Skipping already processed email")
+            continue
 
-    messages = results.get("messages", [])
+        # ==============================
+        # FETCH FULL EMAIL
+        # ==============================
 
-    for msg in messages:
         msg_data = service.users().messages().get(
             userId="me",
-            id=msg["id"],
+            id=gmail_id,
             format="full"
         ).execute()
 
-        payload = msg_data["payload"]
-        headers = payload["headers"]
+        thread_id = msg_data.get("threadId", "")
 
-        subject = next((h["value"] for h in headers if h["name"] == "Subject"), "(No Subject)")
-        sender = next((h["value"] for h in headers if h["name"] == "From"), "")
+        payload = msg_data.get("payload", {})
+        headers = payload.get("headers", [])
 
+        sender = ""
+        subject = ""
+
+        for header in headers:
+
+            if header["name"] == "From":
+                sender = header["value"]
+
+            elif header["name"] == "Subject":
+                subject = header["value"]
+
+        save_contact(
+            name=sender,
+            email=sender,
+            company="",
+            role="",
+            notes="auto-imported from inbox"
+        )
         snippet = msg_data.get("snippet", "")
 
         email_text = f"""
 From: {sender}
 Subject: {subject}
-Message: {snippet}
+
+{snippet}
 """
 
-        reply = generate_email_reply(email_text)
+        embedding = create_embedding(
+            email_text
+        )        
+        
+        embedding_json = json.dumps(
+            embedding
+        )
 
-        print("\n================ EMAIL =================")
+        print("\n================ EMAIL ================\n")
         print(email_text)
 
-        print("\n================ AI DRAFT =================")
-        print(reply)
+        # ==============================
+        # CLASSIFICATION
+        # ==============================
 
-        # CREATE DRAFT IN GMAIL
-        create_draft(service, sender, subject, reply)
+        classification = classify_email(email_text)
 
-        print("\n✔ Draft created in Gmail")
+        label = classification.get(
+            "label",
+            "unknown"
+        )
 
-# ----------------------------
-# MAIN
-# ----------------------------
-def main():
-    service = gmail_auth()
-    process_emails(service)
+        importance_score = classification.get(
+            "importance_score",
+            0
+        )
+
+        sender_trust = classification.get(
+            "sender_trust",
+            "low"
+        )
+
+        reason = classification.get(
+            "reason",
+            ""
+        )
+
+        action = classification.get(
+            "suggested_action",
+            "ignore"
+        )
+
+        print("\n============= CLASSIFICATION =============")
+        print(classification)
+
+        # ==============================
+        # SENDER LEARNING
+        # ==============================
+
+        update_sender(
+            sender,
+            label == "important"
+        )
+
+        cursor.execute("""
+        SELECT email_count, important_count
+        FROM senders
+        WHERE sender = ?
+        """, (sender,))
+
+        row = cursor.fetchone()
+
+        trust_score = 0.0
+
+        if row:
+
+            email_count, important_count = row
+
+            trust_score = (
+                important_count / max(email_count, 1)
+            )
+
+        final_score = importance_score
+
+        if trust_score > 0.7:
+            final_score += 15
+
+        elif trust_score < 0.3:
+            final_score -= 15
+
+        print("\n=========== INBOX SCORE ===========")
+        print("Trust score:", trust_score)
+        print("Final score:", final_score)
+        print("Reason:", reason)
+
+        # ==============================
+        # THREAD MEMORY
+        # ==============================
+
+        existing_summary = get_thread_summary(
+            thread_id
+        )
+
+        updated_summary = summarize_thread(
+            existing_summary,
+            email_text
+        )
+
+        save_thread_summary(
+            thread_id,
+            updated_summary
+        )
+
+        print("\n=========== THREAD MEMORY ===========")
+        print(updated_summary)
+
+        # ==============================
+        # ROUTING
+        # ==============================
+
+        if action == "ignore":
+
+            print("⏭ Ignoring email")
+
+            save_email(
+                gmail_id,
+                thread_id,
+                sender,
+                subject,
+                snippet,
+                email_text,
+                embedding_json,
+                label,
+                action,
+                str(final_score),
+                updated_summary
+            )
+
+            continue
+
+        elif action == "summarize":
+
+            print("🧠 Summary only")
+
+            save_email(
+                gmail_id,
+                thread_id,
+                sender,
+                subject,
+                snippet,
+                email_text,
+                embedding_json,
+                label,
+                action,
+                str(final_score),
+                updated_summary
+            )
+
+            continue
+
+        elif action == "archive":
+
+            print("📥 Archive action")
+
+            save_email(
+                gmail_id,
+                thread_id,
+                sender,
+                subject,
+                snippet,
+                email_text,
+                embedding_json,
+                label,
+                action,
+                str(final_score),
+                updated_summary
+            )
+
+            continue
+
+        elif action == "reply":
+
+            past_emails = semantic_search(
+                embedding,
+                limit=3
+            )
+
+            print("\n========= SEMANTIC MEMORIES =========\n")
+
+            for i, memory in enumerate(past_emails):
+
+                print(f"\nMEMORY {i+1}:\n")
+                print(memory[:1000])
+
+            print("\n=====================================\n")
+            memory_context = "\n\n".join(
+                past_emails
+            )
+
+            reply = generate_reply(
+                email_text,
+                updated_summary,
+                memory_context
+            )
+
+            print("\n================ AI DRAFT ================\n")
+            print(reply)
+
+            create_draft(
+                service,
+                sender,
+                subject,
+                reply
+            )
+
+            save_email(
+                gmail_id,
+                thread_id,
+                sender,
+                subject,
+                snippet,
+                email_text,
+                embedding_json,
+                label,
+                action,
+                str(final_score),
+                updated_summary
+            )
+
+            print("✔ Draft created + memory updated")
+
+        else:
+
+            print("⚠ Unknown action")
+
+            save_email(
+                gmail_id,
+                thread_id,
+                sender,
+                subject,
+                snippet,
+                email_text,
+                embedding_json,
+                label,
+                action,
+                str(final_score),
+                updated_summary
+            )
+
 
 if __name__ == "__main__":
     main()
