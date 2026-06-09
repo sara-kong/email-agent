@@ -10,6 +10,42 @@ DB_PATH = "memory.db"
 def get_conn():
     return sqlite3.connect(DB_PATH)
 
+def init_threads_table():
+    conn = get_conn()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS threads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        gmail_thread_id TEXT UNIQUE,
+        subject TEXT,
+        participants TEXT,
+        message_count INTEGER DEFAULT 0,
+        last_message_snippet TEXT,
+        last_updated TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    conn.commit()
+    conn.close()
+
+def init_contacts_table():
+    conn = get_conn()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS contacts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT UNIQUE,
+        emails_sent INTEGER DEFAULT 0,
+        emails_received INTEGER DEFAULT 0,
+        relationship_score REAL DEFAULT 0,
+        last_contact_date TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    conn.commit()
+    conn.close()
 
 # ==============================
 # SAVE EMAIL
@@ -37,7 +73,7 @@ def save_email(
             sender,
             subject,
             snippet,
-            email_text,
+            full_text,
             embedding,
             category,
             action,
@@ -108,7 +144,7 @@ def get_thread(thread_id):
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT sender, subject, snippet, email_text
+        SELECT sender, subject, snippet, full_text
         FROM emails
         WHERE thread_id = ?
         ORDER BY id ASC
@@ -132,7 +168,7 @@ def semantic_search(embedding, limit=5):
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT email_text, embedding
+        SELECT full_text, embedding
         FROM emails
     """)
 
@@ -168,7 +204,7 @@ def semantic_search_thread(thread_id, embedding, limit=3):
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT email_text, embedding
+        SELECT full_text, embedding
         FROM emails
         WHERE thread_id = ?
     """, (thread_id,))
@@ -195,3 +231,63 @@ def semantic_search_thread(thread_id, embedding, limit=3):
     scored.sort(reverse=True, key=lambda x: x[0])
 
     return [x[1] for x in scored[:limit]]
+
+def upsert_contact(email, received=True):
+    conn = get_conn()
+    cursor = conn.cursor()
+
+    if received:
+        cursor.execute("""
+        INSERT INTO contacts (email, emails_received, last_contact_date)
+        VALUES (?, 1, CURRENT_TIMESTAMP)
+        ON CONFLICT(email)
+        DO UPDATE SET
+            emails_received = emails_received + 1,
+            last_contact_date = CURRENT_TIMESTAMP
+        """, (email,))
+    else:
+        cursor.execute("""
+        INSERT INTO contacts (email, emails_sent, last_contact_date)
+        VALUES (?, 1, CURRENT_TIMESTAMP)
+        ON CONFLICT(email)
+        DO UPDATE SET
+            emails_sent = emails_sent + 1,
+            last_contact_date = CURRENT_TIMESTAMP
+        """, (email,))
+
+    conn.commit()
+    conn.close()
+
+def upsert_thread(thread_id, subject, sender, snippet):
+    conn = get_conn()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+    INSERT INTO threads (
+        gmail_thread_id,
+        subject,
+        participants,
+        message_count,
+        last_message_snippet
+    )
+    VALUES (?, ?, ?, 1, ?)
+    ON CONFLICT(gmail_thread_id)
+    DO UPDATE SET
+        message_count = message_count + 1,
+        last_message_snippet = ?,
+        last_updated = CURRENT_TIMESTAMP
+    """, (
+        thread_id,
+        subject,
+        sender,
+        snippet,
+        snippet
+    ))
+
+    conn.commit()
+    conn.close()
+
+if __name__ == "__main__":
+    init_threads_table()
+    init_contacts_table()
+    print("DB initialized")

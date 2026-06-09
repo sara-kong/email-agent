@@ -9,13 +9,16 @@ from embeddings import create_embedding
 
 from memory import (
     save_email,
-    email_exists
+    email_exists,
+    upsert_contact,
+    upsert_thread
 )
 
 from state_manager import (
     load_state,
     save_state
 )
+
 
 def index_inbox():
 
@@ -42,6 +45,7 @@ def index_inbox():
     for email in emails:
 
         gmail_id = email["id"]
+
         print("EMAIL KEYS:", email.keys())
         print("THREAD ID:", email.get("threadId"))
 
@@ -49,12 +53,11 @@ def index_inbox():
         # DEDUP
         # ==============================
 
-     #  if email_exists(gmail_id):
-
-     #      skipped += 1
-     #      print("⏭ Already indexed")
-
-     #      continue
+        
+        if email_exists(gmail_id):
+            skipped += 1
+            print("⏭ Already indexed")
+            continue
 
         # ==============================
         # FETCH FULL EMAIL
@@ -65,8 +68,6 @@ def index_inbox():
             id=gmail_id,
             format="full"
         ).execute()
-
-        print(msg_data.keys())
 
         thread_id = msg_data.get(
             "threadId",
@@ -94,6 +95,15 @@ def index_inbox():
             elif header["name"] == "Subject":
                 subject = header["value"]
 
+        # ==============================
+        # CONTACT MEMORY
+        # ==============================
+
+        upsert_contact(
+            sender,
+            received=True
+        )
+
         snippet = msg_data.get(
             "snippet",
             ""
@@ -119,7 +129,7 @@ Subject: {subject}
         )
 
         # ==============================
-        # SAVE
+        # SAVE EMAIL
         # ==============================
 
         save_email(
@@ -136,40 +146,28 @@ Subject: {subject}
             ""
         )
 
-        cursor.execute("""
-        INSERT OR IGNORE INTO threads (
-            gmail_thread_id,
-            subject,
-            participants,
-            last_message_snippet
-        )
-        VALUES (?, ?, ?, ?)
-        """, (
+        # ==============================
+        # THREAD MEMORY
+        # ==============================
+
+        upsert_thread(
             thread_id,
             subject,
             sender,
             snippet
-        ))
-
-        cursor.execute("""
-        UPDATE threads
-        SET last_message_snippet = ?
-        WHERE gmail_thread_id = ?
-        """, (
-            snippet,
-            thread_id
-        ))
+        )
 
         indexed += 1
 
         print(f"✔ Indexed: {subject}")
 
-        save_state(next_page_token)
+    save_state(next_page_token)
 
     print("\n============================")
     print(f"Indexed: {indexed}")
     print(f"Skipped: {skipped}")
     print("============================")
+
 
 if __name__ == "__main__":
     index_inbox()
