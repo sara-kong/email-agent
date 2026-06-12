@@ -291,3 +291,71 @@ if __name__ == "__main__":
     init_threads_table()
     init_contacts_table()
     print("DB initialized")
+def get_thread_summary(thread_id):
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS thread_summaries (
+            thread_id TEXT PRIMARY KEY,
+            summary TEXT,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("SELECT summary FROM thread_summaries WHERE thread_id = ?", (thread_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else ""
+
+def save_thread_summary(thread_id, summary):
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS thread_summaries (
+            thread_id TEXT PRIMARY KEY,
+            summary TEXT,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("""
+        INSERT INTO thread_summaries (thread_id, summary)
+        VALUES (?, ?)
+        ON CONFLICT(thread_id) DO UPDATE SET
+            summary = ?,
+            updated_at = CURRENT_TIMESTAMP
+    """, (thread_id, summary, summary))
+    conn.commit()
+    conn.close()
+
+def update_sender(sender, is_important):
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS senders (
+            sender TEXT PRIMARY KEY,
+            email_count INTEGER DEFAULT 0,
+            important_count INTEGER DEFAULT 0,
+            last_seen TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("""
+        INSERT INTO senders (sender, email_count, important_count)
+        VALUES (?, 1, ?)
+        ON CONFLICT(sender) DO UPDATE SET
+            email_count = email_count + 1,
+            important_count = important_count + CASE WHEN ? THEN 1 ELSE 0 END,
+            last_seen = CURRENT_TIMESTAMP
+    """, (sender, 1 if is_important else 0, is_important))
+    conn.commit()
+    conn.close()
+
+def get_recent_emails_from_sender(sender, limit=5):
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT full_text FROM emails
+        WHERE sender LIKE ?
+        ORDER BY id DESC LIMIT ?
+    """, (f"%{sender}%", limit))
+    rows = cursor.fetchall()
+    conn.close()
+    return [r[0] for r in rows]
