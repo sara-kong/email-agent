@@ -28,6 +28,12 @@ def run_migrations():
         )
     """)
 
+    # ── Backfill created_at on emails for DBs created before it existed ──
+    c.execute("PRAGMA table_info(emails)")
+    email_columns = {row[1] for row in c.fetchall()}
+    if "created_at" not in email_columns:
+        c.execute("ALTER TABLE emails ADD COLUMN created_at TEXT")
+
     # ── Senders (from original) ──
     c.execute("""
         CREATE TABLE IF NOT EXISTS senders (

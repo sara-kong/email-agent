@@ -4,10 +4,25 @@ from datetime import datetime, timedelta
 from openai import OpenAI
 from typing import Optional
 
+from corrections import get_sender_pattern
+
 DB_PATH = "memory.db"
 client = OpenAI()
 
 CONTACT_TYPES = ["brand", "peer", "creator", "agency", "fan", "business", "personal", "unknown"]
+
+RELATIONSHIP_TYPES = ["new", "dormant", "active_correspondence", "one_way_inbound"]
+
+# Newsletters/marketing senders are capped here regardless of frequency.
+MARKETING_SCORE_CAP = 15.0
+MARKETING_MIN_CORRECTIONS = 3
+
+# Days since last contact before a relationship is considered dormant.
+DORMANT_AFTER_DAYS = 180
+
+# Days since first contact within which a relationship is still "new",
+# regardless of how many emails have gone back and forth.
+NEW_WITHIN_DAYS = 14
 
 
 # ──────────────────────────────────────────────
@@ -38,6 +53,8 @@ def init_contact_intelligence_tables():
 
             relationship_score  REAL DEFAULT 0.0,
             -- 0-100: based on frequency, recency, reply rate
+            relationship_type   TEXT DEFAULT 'new',
+            -- new | dormant | active_correspondence | one_way_inbound
             is_vip              INTEGER DEFAULT 0,
             vip_reason          TEXT DEFAULT '',
 
@@ -52,6 +69,12 @@ def init_contact_intelligence_tables():
             updated_at          TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # Backfill relationship_type for DBs created before it existed
+    c.execute("PRAGMA table_info(contact_profiles)")
+    columns = {row["name"] for row in c.fetchall()}
+    if "relationship_type" not in columns:
+        c.execute("ALTER TABLE contact_profiles ADD COLUMN relationship_type TEXT DEFAULT 'new'")
 
     conn.commit()
     conn.close()
@@ -146,13 +169,53 @@ def update_ai_summary(email: str, summary: str):
 # RELATIONSHIP SCORE
 # ──────────────────────────────────────────────
 
+def classify_relationship_type(row: sqlite3.Row) -> str:
+    """
+    Classify a contact into one of RELATIONSHIP_TYPES based on
+    interaction counts and recency:
+      - "new": just started exchanging emails, not enough history yet
+      - "dormant": no contact in a long time
+      - "active_correspondence": ongoing two-way exchange
+      - "one_way_inbound": one-directional (usually they email you, no reply)
+    """
+    received = row["emails_received"] or 0
+    sent = row["emails_sent"] or 0
+    total = received + sent
+
+    if total == 0:
+        return "new"
+
+    now = datetime.utcnow()
+
+    if row["first_contact_date"]:
+        try:
+            first = datetime.fromisoformat(row["first_contact_date"])
+            if (now - first).days <= NEW_WITHIN_DAYS:
+                return "new"
+        except Exception:
+            pass
+
+    if row["last_contact_date"]:
+        try:
+            last = datetime.fromisoformat(row["last_contact_date"])
+            if (now - last).days > DORMANT_AFTER_DAYS:
+                return "dormant"
+        except Exception:
+            pass
+
+    if received > 0 and sent > 0:
+        return "active_correspondence"
+
+    return "one_way_inbound"
+
+
 def compute_relationship_score(email: str) -> float:
     """
     Score = weighted combo of:
+      - Bidirectionality (they email you AND you email them) — weighted heaviest
       - Total interactions (sent + received)
       - Recency (higher if contacted in last 30/90 days)
-      - Bidirectionality (they email you AND you email them)
-    Returns 0.0–100.0
+    Returns 0.0–100.0, capped low for known newsletter/marketing senders.
     """
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -168,37 +231,49 @@ def compute_relationship_score(email: str) -> float:
     sent = row["emails_sent"] or 0
     total = received + sent
 
-    # Frequency score (0-40)
-    freq_score = min(total * 2, 40)
+    # Bidirectionality score (0-40) — the strongest signal of a real relationship
+    bidir_score = 40.0 if (received > 0 and sent > 0) else 0.0
 
-    # Recency score (0-40)
+    # Frequency score (0-30)
+    freq_score = min(total * 2, 30)
+
+    # Recency score (0-30)
     recency_score = 0.0
     if row["last_contact_date"]:
         try:
             last = datetime.fromisoformat(row["last_contact_date"])
             days_ago = (datetime.utcnow() - last).days
             if days_ago <= 7:
-                recency_score = 40
-            elif days_ago <= 30:
                 recency_score = 30
+            elif days_ago <= 30:
+                recency_score = 22
             elif days_ago <= 90:
-                recency_score = 15
+                recency_score = 11
             elif days_ago <= 180:
-                recency_score = 5
+                recency_score = 4
         except Exception:
             pass
 
-    # Bidirectionality score (0-20)
-    bidir_score = 20.0 if (received > 0 and sent > 0) else 0.0
+    score = round(bidir_score + freq_score + recency_score, 1)
 
-    score = round(freq_score + recency_score + bidir_score, 1)
+    # Newsletter/marketing senders are capped regardless of how often they email,
+    # detected via repeated user corrections to "marketing" for this domain.
+    pattern = get_sender_pattern(email)
+    if (
+        pattern
+        and pattern["typical_category"] == "marketing"
+        and pattern["correction_count"] >= MARKETING_MIN_CORRECTIONS
+    ):
+        score = min(score, MARKETING_SCORE_CAP)
 
-    # Persist the updated score
+    relationship_type = classify_relationship_type(row)
+
+    # Persist the updated score and relationship type
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
-        "UPDATE contact_profiles SET relationship_score = ? WHERE email = ?",
-        (score, email)
+        "UPDATE contact_profiles SET relationship_score = ?, relationship_type = ? WHERE email = ?",
+        (score, relationship_type, email)
     )
     conn.commit()
     conn.close()

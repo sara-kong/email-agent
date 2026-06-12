@@ -1,7 +1,13 @@
 import sqlite3
 import json
+import math
+from datetime import datetime
 
 DB_PATH = "memory.db"
+
+# Half-life-style exponential decay applied to semantic search scores.
+# Emails older than ~6 months should rarely surface unless very semantically relevant.
+DEFAULT_DECAY_DAYS = 90
 
 
 # ==============================
@@ -78,9 +84,10 @@ def save_email(
             category,
             action,
             importance,
-            summary
+            summary,
+            created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     """, (
         gmail_id,
         thread_id,
@@ -157,36 +164,57 @@ def get_thread(thread_id):
 
 
 # ==============================
+# SHARED SIMILARITY HELPER
+# ==============================
+def cosine_similarity(a, b):
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(x * x for x in b) ** 0.5
+    return dot / (norm_a * norm_b + 1e-8)
+
+
+# ==============================
 # BASIC SEMANTIC SEARCH (SAFE VERSION)
 # ==============================
-def semantic_search(embedding, limit=5):
+def semantic_search(embedding, limit=5, decay_days=DEFAULT_DECAY_DAYS):
     """
-    NOTE: assumes embeddings are stored as JSON lists
+    NOTE: assumes embeddings are stored as JSON lists.
+
+    Ranks by cosine_similarity * decay_factor, where
+    decay_factor = exp(-days_since_email / decay_days). Emails without a
+    known created_at (older rows from before this column existed) are not
+    penalized, since their age is unknown.
     """
 
     conn = get_conn()
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT full_text, embedding
+        SELECT full_text, embedding, created_at
         FROM emails
     """)
 
     rows = cursor.fetchall()
     conn.close()
 
-    def cosine(a, b):
-        dot = sum(x * y for x, y in zip(a, b))
-        norm_a = sum(x * x for x in a) ** 0.5
-        norm_b = sum(x * x for x in b) ** 0.5
-        return dot / (norm_a * norm_b + 1e-8)
-
+    now = datetime.now()
     scored = []
 
-    for text, emb_json in rows:
+    for text, emb_json, created_at in rows:
         try:
             emb = json.loads(emb_json)
-            score = cosine(embedding, emb)
+            similarity = cosine_similarity(embedding, emb)
+
+            decay_factor = 1.0
+            if created_at:
+                try:
+                    email_date = datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S")
+                    days_since = (now - email_date).total_seconds() / 86400
+                    decay_factor = math.exp(-days_since / decay_days)
+                except ValueError:
+                    pass
+
+            score = similarity * decay_factor
             scored.append((score, text))
         except:
             continue

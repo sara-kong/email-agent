@@ -55,7 +55,7 @@ def process_single_email(service, gmail_id: str, event_callback=None):
 
     # Embed + classify
     embedding = create_embedding(email_text)
-    classification = classify_email(email_text)
+    classification = classify_email(email_text, sender=sender, embedding=embedding)
     label = classification.get("label", "unknown")
     action = classification.get("suggested_action", "ignore")
     importance_score = classification.get("importance_score", 0)

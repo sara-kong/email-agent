@@ -112,7 +112,7 @@ Subject: {subject}
         # CLASSIFICATION
         # ==============================
 
-        classification = classify_email(email_text)
+        classification = classify_email(email_text, sender=sender, embedding=embedding)
 
         label = classification.get(
             "label",

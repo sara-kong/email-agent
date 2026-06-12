@@ -42,6 +42,7 @@ from style_profiler import (
     build_style_profile
 )
 from outbound import generate_outreach_email
+from corrections import init_corrections_table, init_sender_patterns_table, log_correction
 
 
 # ──────────────────────────────────────────────
@@ -100,6 +101,8 @@ async def startup():
     init_campaign_tables()
     init_contact_intelligence_tables()
     init_style_table()
+    init_corrections_table()
+    init_sender_patterns_table()
     print("✔ API server started")
 
 
@@ -161,7 +164,7 @@ async def _process_inbox_task(max_results: int, label_ids: list[str]):
         email_text = email_data["email_text"]
 
         embedding = create_embedding(email_text)
-        classification = classify_email(email_text)
+        classification = classify_email(email_text, sender=sender, embedding=embedding)
         label = classification.get("label", "unknown")
         action = classification.get("suggested_action", "ignore")
         score = classification.get("importance_score", 0)
@@ -234,6 +237,66 @@ def get_email(gmail_id: str):
     return dict(row)
 
 
+@app.get("/inbox/threads/{thread_id}")
+def get_thread_endpoint(thread_id: str):
+    """Fetch the full Gmail conversation for a thread, including sent replies."""
+    try:
+        messages = fetch_thread(get_service(), thread_id)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Thread not found: {e}")
+
+    summary = get_thread_summary(thread_id)
+    return {"thread_id": thread_id, "summary": summary, "messages": messages}
+
+
+class EmailCorrectionRequest(BaseModel):
+    category: str
+    action: Optional[str] = None
+
+@app.post("/inbox/emails/{gmail_id}/correct")
+def correct_email(gmail_id: str, req: EmailCorrectionRequest):
+    """Record a user correction to an email's category/action and log it for future classification."""
+    import sqlite3
+    conn = sqlite3.connect("memory.db")
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM emails WHERE gmail_id = ?", (gmail_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Email not found")
+
+    original_category = row["category"]
+    original_action = row["action"]
+    corrected_category = req.category
+    corrected_action = req.action or original_action
+
+    c.execute(
+        "UPDATE emails SET category = ?, action = ? WHERE gmail_id = ?",
+        (corrected_category, corrected_action, gmail_id)
+    )
+    conn.commit()
+    conn.close()
+
+    log_correction(
+        gmail_id=gmail_id,
+        sender=row["sender"],
+        original_category=original_category,
+        corrected_category=corrected_category,
+        original_action=original_action,
+        corrected_action=corrected_action,
+        email_text=row["full_text"],
+        embedding_json=row["embedding"],
+    )
+
+    return {
+        "status": "corrected",
+        "gmail_id": gmail_id,
+        "category": corrected_category,
+        "action": corrected_action,
+    }
+
+
 # ──────────────────────────────────────────────
 # REPLY / DRAFT GENERATION
 # ──────────────────────────────────────────────
@@ -243,14 +306,18 @@ class GenerateReplyRequest(BaseModel):
     email_text: str
     thread_summary: Optional[str] = ""
     auto_send: bool = False
+    final_text: Optional[str] = None
 
 @app.post("/inbox/reply")
 def generate_reply_endpoint(req: GenerateReplyRequest):
-    embedding = create_embedding(req.email_text)
-    memory_context = "\n\n".join(semantic_search(embedding, limit=3))
-    style_prompt = get_style_prompt()
-
-    reply = generate_reply(req.email_text, req.thread_summary or "", memory_context, style_prompt)
+    if req.final_text is not None:
+        # User has already generated and edited a draft; use it as-is.
+        reply = req.final_text
+    else:
+        embedding = create_embedding(req.email_text)
+        memory_context = "\n\n".join(semantic_search(embedding, limit=3))
+        style_prompt = get_style_prompt()
+        reply = generate_reply(req.email_text, req.thread_summary or "", memory_context, style_prompt)
 
     if req.auto_send:
         # Create a Gmail draft
@@ -367,6 +434,18 @@ def get_campaign_endpoint(campaign_id: int):
     campaign["contacts"] = get_campaign_contacts(campaign_id)
     campaign["stats"] = get_campaign_stats(campaign_id)
     return campaign
+
+
+class AddCampaignContactsRequest(BaseModel):
+    emails: list[str]
+
+@app.post("/campaigns/{campaign_id}/contacts")
+def add_campaign_contacts(campaign_id: int, req: AddCampaignContactsRequest):
+    if not get_campaign(campaign_id):
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    for email in req.emails:
+        add_contact_to_campaign(campaign_id, email)
+    return {"status": "added", "count": len(req.emails)}
 
 
 class OutboundEmailRequest(BaseModel):

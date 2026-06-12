@@ -1,6 +1,7 @@
 'use client'
 
 import { useEffect, useState } from 'react'
+import { shortName, initials, badgeColors, avatarColors } from '@/lib/email'
 
 const API = '/api'
 
@@ -39,31 +40,6 @@ export default function Dashboard() {
     setAgentResponse(data.response)
     setAgentLoading(false)
   }
-
-  function initials(name: string) {
-    return name.replace(/<.*?>/, '').trim().split(' ').slice(0, 2).map((w: string) => w[0]).join('').toUpperCase().slice(0, 2)
-  }
-
-  function shortName(sender: string) {
-    const match = sender.match(/^([^<]+)/)
-    return match ? match[1].trim().replace(/"/g, '') : sender
-  }
-
-  const badgeColors: Record<string, string> = {
-    important: 'bg-rose-50 text-rose-700',
-    marketing: 'bg-amber-50 text-amber-700',
-    social: 'bg-violet-50 text-violet-700',
-    historical: 'bg-stone-100 text-stone-500',
-    unknown: 'bg-stone-100 text-stone-500',
-  }
-
-  const avatarColors = [
-    'bg-teal-50 text-teal-700',
-    'bg-rose-50 text-rose-700',
-    'bg-violet-50 text-violet-700',
-    'bg-blue-50 text-blue-700',
-    'bg-amber-50 text-amber-700',
-  ]
 
   if (loading) return (
     <div className="min-h-screen flex items-center justify-center bg-stone-50">
