@@ -266,3 +266,15 @@ create table if not exists oauth_tokens (
     created_at                  timestamptz default now(),
     updated_at                  timestamptz default now()
 );
+
+-- ==============================
+-- OAUTH STATE (CSRF protection for the login redirect)
+-- ==============================
+-- Stored server-side rather than in a cookie so the redirect round-trip
+-- through accounts.google.com works regardless of cross-domain cookie
+-- policy (e.g. Vercel frontend + Railway backend in production). Each
+-- state token is one-time-use and expires after OAUTH_STATE_TTL (auth.py).
+create table if not exists oauth_states (
+    state       text primary key,
+    created_at  timestamptz not null default now()
+);

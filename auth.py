@@ -1,4 +1,5 @@
 import os
+import secrets
 from datetime import datetime, timedelta, timezone
 
 import jwt
@@ -25,6 +26,14 @@ JWT_ALGORITHM = "HS256"
 SESSION_TTL_DAYS = 30
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
+
+# Cross-domain deployments (Vercel frontend + Railway backend) need
+# SameSite=None; Secure for the session cookie to be sent on API requests
+# to a different domain. Localhost dev uses plain HTTP, where SameSite=None
+# cookies are rejected by browsers, so fall back to Lax there.
+IS_PRODUCTION = FRONTEND_URL.startswith("https://")
+COOKIE_SECURE = IS_PRODUCTION
+COOKIE_SAMESITE = "none" if IS_PRODUCTION else "lax"
 
 GOOGLE_SCOPES = [
     "openid",
@@ -77,6 +86,36 @@ def get_google_userinfo(access_token: str) -> dict:
     )
     resp.raise_for_status()
     return resp.json()
+
+
+# ==============================
+# OAUTH STATE (CSRF protection for the login redirect)
+# ==============================
+OAUTH_STATE_TTL = timedelta(minutes=10)
+
+
+def create_oauth_state() -> str:
+    """Generates a one-time OAuth state token and stores it server-side
+    (also sweeps out any expired tokens)."""
+    state = secrets.token_urlsafe(24)
+    with db_cursor(commit=True) as cur:
+        cur.execute(
+            "delete from oauth_states where created_at < %s",
+            (datetime.now(timezone.utc) - OAUTH_STATE_TTL,),
+        )
+        cur.execute("insert into oauth_states (state) values (%s)", (state,))
+    return state
+
+
+def consume_oauth_state(state: str) -> bool:
+    """Validates and deletes a one-time OAuth state token. Returns False if
+    the state is unknown, already used, or older than OAUTH_STATE_TTL."""
+    with db_cursor(commit=True) as cur:
+        cur.execute(
+            "delete from oauth_states where state = %s and created_at > %s returning state",
+            (state, datetime.now(timezone.utc) - OAUTH_STATE_TTL),
+        )
+        return cur.fetchone() is not None
 
 
 # ==============================

@@ -4,7 +4,6 @@ sys.path.insert(0, os.path.abspath("."))
 
 import json
 import asyncio
-import secrets
 from typing import Optional
 from datetime import datetime
 
@@ -50,7 +49,8 @@ from daemon import start_daemon
 from auth import (
     get_google_auth_url, exchange_code_for_tokens, get_google_userinfo,
     find_or_create_supabase_user, save_oauth_tokens,
-    create_session_jwt, verify_session_jwt, get_gmail_service_for_user, FRONTEND_URL
+    create_session_jwt, verify_session_jwt, get_gmail_service_for_user, FRONTEND_URL,
+    create_oauth_state, consume_oauth_state, COOKIE_SECURE, COOKIE_SAMESITE
 )
 
 
@@ -62,7 +62,8 @@ app = FastAPI(title="Email Agent API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "https://*.vercel.app"],
+    allow_origins=["http://localhost:3000"],
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -153,13 +154,8 @@ def health():
 
 @app.get("/auth/google/login")
 def auth_google_login():
-    state = secrets.token_urlsafe(24)
-    response = RedirectResponse(get_google_auth_url(state))
-    response.set_cookie(
-        "oauth_state", state,
-        httponly=True, samesite="lax", max_age=600,
-    )
-    return response
+    state = create_oauth_state()
+    return RedirectResponse(get_google_auth_url(state))
 
 
 @app.get("/auth/google/callback")
@@ -167,11 +163,10 @@ def auth_google_callback(
     code: Optional[str] = None,
     state: Optional[str] = None,
     error: Optional[str] = None,
-    oauth_state: Optional[str] = Cookie(default=None),
 ):
     if error:
         raise HTTPException(status_code=400, detail=f"Google OAuth error: {error}")
-    if not code or not state or state != oauth_state:
+    if not code or not state or not consume_oauth_state(state):
         raise HTTPException(status_code=400, detail="Invalid OAuth state")
 
     token_response = exchange_code_for_tokens(code)
@@ -192,10 +187,9 @@ def auth_google_callback(
     session_token = create_session_jwt(user_id, email)
 
     redirect = RedirectResponse(f"{FRONTEND_URL}/")
-    redirect.delete_cookie("oauth_state")
     redirect.set_cookie(
         "session_token", session_token,
-        httponly=True, samesite="lax", max_age=30 * 24 * 3600,
+        httponly=True, samesite=COOKIE_SAMESITE, secure=COOKIE_SECURE, max_age=30 * 24 * 3600,
     )
     return redirect
 
@@ -214,7 +208,7 @@ def auth_me(session_token: Optional[str] = Cookie(default=None)):
 @app.post("/auth/logout")
 def auth_logout():
     response = Response(status_code=204)
-    response.delete_cookie("session_token")
+    response.delete_cookie("session_token", samesite=COOKIE_SAMESITE, secure=COOKIE_SECURE)
     return response
 
 
