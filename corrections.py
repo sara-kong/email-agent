@@ -1,11 +1,8 @@
-import sqlite3
-import json
 import re
 from typing import Optional
 
 from memory import cosine_similarity
-
-DB_PATH = "memory.db"
+from db import db_cursor
 
 # A sender domain needs this many corrections to the SAME category before
 # it's treated as a high-confidence prior (and can skip the GPT call).
@@ -15,50 +12,14 @@ SENDER_PATTERN_MIN_COUNT = 3
 FEW_SHOT_LIMIT = 8
 
 
-def get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
 def init_corrections_table():
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS corrections (
-            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-            gmail_id            TEXT,
-            sender              TEXT,
-            sender_domain       TEXT,
-            original_category   TEXT,
-            corrected_category  TEXT,
-            original_action     TEXT,
-            corrected_action    TEXT,
-            email_text          TEXT,
-            embedding           TEXT,
-            created_at          TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    conn.close()
-    print("✔ Corrections table initialized")
+    """No-op — table is created by supabase/schema.sql."""
+    pass
 
 
 def init_sender_patterns_table():
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS sender_patterns (
-            sender_domain       TEXT PRIMARY KEY,
-            typical_category    TEXT,
-            typical_action      TEXT,
-            correction_count    INTEGER DEFAULT 0,
-            last_updated        TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    conn.close()
-    print("✔ Sender patterns table initialized")
+    """No-op — table is created by supabase/schema.sql."""
+    pass
 
 
 def extract_domain(sender: str) -> str:
@@ -68,6 +29,7 @@ def extract_domain(sender: str) -> str:
 
 
 def log_correction(
+    user_id: str,
     gmail_id: str,
     sender: str,
     original_category: str,
@@ -75,85 +37,82 @@ def log_correction(
     original_action: str,
     corrected_action: str,
     email_text: str,
-    embedding_json: Optional[str] = None,
+    embedding: Optional[list] = None,
 ):
     """Record a user correction to an email's classification for future few-shot examples."""
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO corrections (
-            gmail_id, sender, sender_domain,
+    with db_cursor(commit=True) as cur:
+        cur.execute("""
+            INSERT INTO corrections (
+                user_id, gmail_id, sender, sender_domain,
+                original_category, corrected_category,
+                original_action, corrected_action,
+                email_text, embedding
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            user_id, gmail_id, sender, extract_domain(sender),
             original_category, corrected_category,
             original_action, corrected_action,
             email_text, embedding
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        gmail_id, sender, extract_domain(sender),
-        original_category, corrected_category,
-        original_action, corrected_action,
-        email_text, embedding_json
-    ))
-    conn.commit()
-    conn.close()
+        ))
 
-    update_sender_pattern(extract_domain(sender), corrected_category, corrected_action)
+    update_sender_pattern(user_id, extract_domain(sender), corrected_category, corrected_action)
 
 
-def update_sender_pattern(sender_domain: str, category: str, action: str):
+def update_sender_pattern(user_id: str, sender_domain: str, category: str, action: str):
     """
     Track what category/action a sender domain is typically corrected to.
     If the new correction matches the existing pattern, reinforce it
     (increment correction_count). If it disagrees, the user has changed
     their mind about this domain — start the count over with the new value.
     """
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT * FROM sender_patterns WHERE sender_domain = ?", (sender_domain,))
-    row = c.fetchone()
+    with db_cursor(commit=True, dict_rows=True) as cur:
+        cur.execute(
+            "SELECT * FROM sender_patterns WHERE user_id = %s AND sender_domain = %s",
+            (user_id, sender_domain)
+        )
+        row = cur.fetchone()
 
-    if row and row["typical_category"] == category:
-        c.execute("""
-            UPDATE sender_patterns
-            SET correction_count = correction_count + 1,
-                typical_action = ?,
-                last_updated = CURRENT_TIMESTAMP
-            WHERE sender_domain = ?
-        """, (action, sender_domain))
-    else:
-        c.execute("""
-            INSERT INTO sender_patterns (sender_domain, typical_category, typical_action, correction_count, last_updated)
-            VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)
-            ON CONFLICT(sender_domain) DO UPDATE SET
-                typical_category = excluded.typical_category,
-                typical_action = excluded.typical_action,
-                correction_count = 1,
-                last_updated = CURRENT_TIMESTAMP
-        """, (sender_domain, category, action))
-
-    conn.commit()
-    conn.close()
+        if row and row["typical_category"] == category:
+            cur.execute("""
+                UPDATE sender_patterns
+                SET correction_count = correction_count + 1,
+                    typical_action = %s,
+                    last_updated = now()
+                WHERE user_id = %s AND sender_domain = %s
+            """, (action, user_id, sender_domain))
+        else:
+            cur.execute("""
+                INSERT INTO sender_patterns (user_id, sender_domain, typical_category, typical_action, correction_count, last_updated)
+                VALUES (%s, %s, %s, %s, 1, now())
+                ON CONFLICT (user_id, sender_domain) DO UPDATE SET
+                    typical_category = excluded.typical_category,
+                    typical_action = excluded.typical_action,
+                    correction_count = 1,
+                    last_updated = now()
+            """, (user_id, sender_domain, category, action))
 
 
-def get_sender_pattern(sender: str) -> Optional[dict]:
+def get_sender_pattern(user_id: str, sender: str) -> Optional[dict]:
     """Return the learned correction pattern for this sender's domain, if any."""
     domain = extract_domain(sender)
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT * FROM sender_patterns WHERE sender_domain = ?", (domain,))
-    row = c.fetchone()
-    conn.close()
-    return dict(row) if row else None
+    with db_cursor(dict_rows=True) as cur:
+        cur.execute(
+            "SELECT * FROM sender_patterns WHERE user_id = %s AND sender_domain = %s",
+            (user_id, domain)
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
 
 
-def get_high_confidence_pattern(sender: str, min_count: int = SENDER_PATTERN_MIN_COUNT) -> Optional[dict]:
+def get_high_confidence_pattern(user_id: str, sender: str, min_count: int = SENDER_PATTERN_MIN_COUNT) -> Optional[dict]:
     """Return the sender pattern only if it's been confirmed enough times to trust as a strong prior."""
-    pattern = get_sender_pattern(sender)
+    pattern = get_sender_pattern(user_id, sender)
     if pattern and pattern["correction_count"] >= min_count:
         return pattern
     return None
 
 
-def get_relevant_corrections(sender: str = None, embedding: list = None, limit: int = FEW_SHOT_LIMIT) -> list[dict]:
+def get_relevant_corrections(user_id: str, sender: str = None, embedding: list = None, limit: int = FEW_SHOT_LIMIT) -> list[dict]:
     """
     Pull past corrections to use as few-shot classification examples, preferring:
       1. Corrections from the same sender domain (most recent first)
@@ -161,11 +120,12 @@ def get_relevant_corrections(sender: str = None, embedding: list = None, limit: 
          similarity to the email being classified (if an embedding is given)
     Returns [] if no corrections have been logged yet.
     """
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT * FROM corrections ORDER BY created_at DESC")
-    rows = [dict(r) for r in c.fetchall()]
-    conn.close()
+    with db_cursor(dict_rows=True) as cur:
+        cur.execute(
+            "SELECT * FROM corrections WHERE user_id = %s ORDER BY created_at DESC",
+            (user_id,)
+        )
+        rows = [dict(r) for r in cur.fetchall()]
 
     if not rows:
         return []
@@ -182,11 +142,10 @@ def get_relevant_corrections(sender: str = None, embedding: list = None, limit: 
         if embedding:
             scored = []
             for r in remaining:
-                if not r.get("embedding"):
+                if r.get("embedding") is None:
                     continue
                 try:
-                    emb = json.loads(r["embedding"])
-                    scored.append((cosine_similarity(embedding, emb), r))
+                    scored.append((cosine_similarity(embedding, r["embedding"]), r))
                 except Exception:
                     continue
             scored.sort(reverse=True, key=lambda x: x[0])
@@ -195,8 +154,3 @@ def get_relevant_corrections(sender: str = None, embedding: list = None, limit: 
             selected += remaining[:slots_left]
 
     return selected[:limit]
-
-
-if __name__ == "__main__":
-    init_corrections_table()
-    init_sender_patterns_table()

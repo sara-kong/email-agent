@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react'
 import { shortName, initials, avatarColors, campaignStatusColors, contactStatusColors, formatDate } from '@/lib/email'
+import { apiFetch } from '@/lib/api'
 
 const API = '/api'
 
@@ -83,7 +84,7 @@ export default function CampaignsPage() {
     }
     setSearching(true)
     const timer = setTimeout(async () => {
-      const res = await fetch(`${API}/contacts?q=${encodeURIComponent(contactQuery)}`)
+      const res = await apiFetch(`${API}/contacts?q=${encodeURIComponent(contactQuery)}`)
       const data = await res.json()
       setContactResults(data.contacts || [])
       setSearching(false)
@@ -93,7 +94,7 @@ export default function CampaignsPage() {
 
   async function loadCampaigns() {
     setLoading(true)
-    const res = await fetch(`${API}/campaigns`)
+    const res = await apiFetch(`${API}/campaigns`)
     const data = await res.json()
     setCampaigns(data.campaigns || [])
     setLoading(false)
@@ -109,7 +110,7 @@ export default function CampaignsPage() {
 
   async function loadDetail(id: number, resetPrompt = false) {
     setDetailLoading(true)
-    const res = await fetch(`${API}/campaigns/${id}`)
+    const res = await apiFetch(`${API}/campaigns/${id}`)
     const data = await res.json()
     setDetail(data)
     if (resetPrompt) setCampaignPrompt(data.goal || '')
@@ -120,7 +121,7 @@ export default function CampaignsPage() {
     if (!newName.trim()) return
     setCreating(true)
     try {
-      const res = await fetch(`${API}/campaigns`, {
+      const res = await apiFetch(`${API}/campaigns`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: newName, goal: newGoal, contacts: [] }),
@@ -138,7 +139,7 @@ export default function CampaignsPage() {
 
   async function updateStatus(status: string) {
     if (!detail) return
-    await fetch(`${API}/campaigns/${detail.id}/status`, {
+    await apiFetch(`${API}/campaigns/${detail.id}/status`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ status }),
@@ -150,7 +151,7 @@ export default function CampaignsPage() {
     if (!detail) return
     setAddingEmail(email)
     try {
-      await fetch(`${API}/campaigns/${detail.id}/contacts`, {
+      await apiFetch(`${API}/campaigns/${detail.id}/contacts`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ emails: [email] }),
@@ -167,7 +168,7 @@ export default function CampaignsPage() {
     if (!detail || !campaignPrompt.trim()) return
     setSendingFor(contactEmail)
     try {
-      const res = await fetch(`${API}/campaigns/${detail.id}/send`, {
+      const res = await apiFetch(`${API}/campaigns/${detail.id}/send`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

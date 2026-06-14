@@ -34,6 +34,14 @@ def run_migrations():
     if "created_at" not in email_columns:
         c.execute("ALTER TABLE emails ADD COLUMN created_at TEXT")
 
+    # ── Draft tracking columns for auto-generated replies ──
+    if "draft_status" not in email_columns:
+        c.execute("ALTER TABLE emails ADD COLUMN draft_status TEXT DEFAULT 'none'")
+    if "draft_text" not in email_columns:
+        c.execute("ALTER TABLE emails ADD COLUMN draft_text TEXT")
+    if "draft_gmail_id" not in email_columns:
+        c.execute("ALTER TABLE emails ADD COLUMN draft_gmail_id TEXT")
+
     # ── Senders (from original) ──
     c.execute("""
         CREATE TABLE IF NOT EXISTS senders (
@@ -158,6 +166,23 @@ def run_migrations():
             last_updated        TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # ── Backfill threads columns for DBs whose `threads` table predates this schema ──
+    c.execute("PRAGMA table_info(threads)")
+    thread_columns = {row[1] for row in c.fetchall()}
+    if "gmail_thread_id" not in thread_columns:
+        c.execute("ALTER TABLE threads ADD COLUMN gmail_thread_id TEXT")
+    if "subject" not in thread_columns:
+        c.execute("ALTER TABLE threads ADD COLUMN subject TEXT")
+    if "participants" not in thread_columns:
+        c.execute("ALTER TABLE threads ADD COLUMN participants TEXT")
+    if "message_count" not in thread_columns:
+        c.execute("ALTER TABLE threads ADD COLUMN message_count INTEGER DEFAULT 0")
+    if "last_message_snippet" not in thread_columns:
+        c.execute("ALTER TABLE threads ADD COLUMN last_message_snippet TEXT")
+    if "last_updated" not in thread_columns:
+        c.execute("ALTER TABLE threads ADD COLUMN last_updated TEXT")
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_threads_gmail_thread_id ON threads(gmail_thread_id)")
 
     # ── Contacts (original table — keep for backward compat) ──
     c.execute("""

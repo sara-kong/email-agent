@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react'
 import { shortName, initials, badgeColors, avatarColors, formatDate } from '@/lib/email'
+import { apiFetch } from '@/lib/api'
 
 const API = '/api'
 
@@ -18,6 +19,8 @@ type EmailRow = {
   importance: string
   summary: string
   created_at: string
+  draft_status?: string
+  draft_text?: string
 }
 
 type ThreadMessage = {
@@ -58,6 +61,15 @@ function TagIcon({ className }: { className?: string }) {
   )
 }
 
+function SparkleIcon({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="currentColor" className={className}>
+      <path d="M12 2l1.5 4.5L18 8l-4.5 1.5L12 14l-1.5-4.5L6 8l4.5-1.5z" />
+      <path d="M19 14l.8 2.4 2.4.8-2.4.8-.8 2.4-.8-2.4-2.4-.8 2.4-.8z" />
+    </svg>
+  )
+}
+
 export default function InboxPage() {
   const [emails, setEmails] = useState<EmailRow[]>([])
   const [loading, setLoading] = useState(true)
@@ -70,6 +82,7 @@ export default function InboxPage() {
   const [reply, setReply] = useState('')
   const [replyLoading, setReplyLoading] = useState(false)
   const [draftStatus, setDraftStatus] = useState<'idle' | 'creating' | 'created' | 'error'>('idle')
+  const [sendStatus, setSendStatus] = useState<'idle' | 'sending' | 'sent' | 'error'>('idle')
 
   const [correctingId, setCorrectingId] = useState<string | null>(null)
   const [correctedFlash, setCorrectedFlash] = useState<string | null>(null)
@@ -81,7 +94,7 @@ export default function InboxPage() {
   async function loadEmails(category: string) {
     setLoading(true)
     const qs = category ? `&label=${category}` : ''
-    const res = await fetch(`${API}/inbox/emails?limit=30${qs}`)
+    const res = await apiFetch(`${API}/inbox/emails?limit=30${qs}`)
     const data = await res.json()
     setEmails(data.emails || [])
     setLoading(false)
@@ -89,12 +102,13 @@ export default function InboxPage() {
 
   async function openEmail(email: EmailRow) {
     setSelected(email)
-    setReply('')
+    setReply(email.draft_status === 'ready' ? (email.draft_text || '') : '')
     setDraftStatus('idle')
+    setSendStatus('idle')
     setThread([])
     setThreadLoading(true)
     try {
-      const res = await fetch(`${API}/inbox/threads/${email.thread_id}`)
+      const res = await apiFetch(`${API}/inbox/threads/${email.thread_id}`)
       const data = await res.json()
       setThread(data.messages || [])
     } catch {
@@ -115,7 +129,7 @@ export default function InboxPage() {
     setCorrectingId(email.gmail_id)
 
     try {
-      const res = await fetch(`${API}/inbox/emails/${email.gmail_id}/correct`, {
+      const res = await apiFetch(`${API}/inbox/emails/${email.gmail_id}/correct`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ category, action }),
@@ -137,7 +151,7 @@ export default function InboxPage() {
     setReplyLoading(true)
     setDraftStatus('idle')
     try {
-      const res = await fetch(`${API}/inbox/reply`, {
+      const res = await apiFetch(`${API}/inbox/reply`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -160,7 +174,7 @@ export default function InboxPage() {
     if (!selected || !reply.trim()) return
     setDraftStatus('creating')
     try {
-      const res = await fetch(`${API}/inbox/reply`, {
+      const res = await apiFetch(`${API}/inbox/reply`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -175,6 +189,26 @@ export default function InboxPage() {
       setDraftStatus('created')
     } catch {
       setDraftStatus('error')
+    }
+  }
+
+  async function sendDraft() {
+    if (!selected || !reply.trim()) return
+    if (!window.confirm('Send this email now? This will actually send via Gmail.')) return
+
+    setSendStatus('sending')
+    try {
+      const res = await apiFetch(`${API}/inbox/emails/${selected.gmail_id}/draft/send`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ final_text: reply }),
+      })
+      if (!res.ok) throw new Error('failed')
+      setSendStatus('sent')
+      setEmails(list => list.map(em => em.gmail_id === selected.gmail_id ? { ...em, draft_status: 'sent' } : em))
+      setSelected(s => (s && s.gmail_id === selected.gmail_id ? { ...s, draft_status: 'sent' } : s))
+    } catch {
+      setSendStatus('error')
     }
   }
 
@@ -232,6 +266,12 @@ export default function InboxPage() {
                     <span className={`text-xs px-2 py-0.5 rounded-full ${badgeColors[e.category] || badgeColors.unknown}`}>
                       {e.category}
                     </span>
+                    {e.draft_status === 'ready' && (
+                      <span className="flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-teal-50 text-teal-600">
+                        <SparkleIcon className="w-3 h-3" />
+                        draft ready
+                      </span>
+                    )}
                     <div className="h-4 flex items-center gap-0.5">
                       {correctedFlash === e.gmail_id ? (
                         <span className="text-xs text-teal-600">✓</span>
@@ -307,9 +347,20 @@ export default function InboxPage() {
                       {replyLoading ? 'generating...' : 'generate draft ✦'}
                     </button>
                   </div>
+                  {selected.draft_status === 'ready' && (
+                    <div className="flex items-center gap-1.5 text-xs text-teal-600 bg-teal-50 rounded-lg px-3 py-1.5 mb-2">
+                      <SparkleIcon className="w-3 h-3" />
+                      AI draft ready — review before sending
+                    </div>
+                  )}
+                  {selected.draft_status === 'sent' && (
+                    <div className="text-xs text-stone-400 bg-stone-50 rounded-lg px-3 py-1.5 mb-2">
+                      Sent ✓
+                    </div>
+                  )}
                   <textarea
                     value={reply}
-                    onChange={e => { setReply(e.target.value); setDraftStatus('idle') }}
+                    onChange={e => { setReply(e.target.value); setDraftStatus('idle'); setSendStatus('idle') }}
                     placeholder="Generate a draft in your voice, or write your own reply..."
                     className="w-full min-h-[160px] text-sm text-stone-600 bg-stone-50 rounded-lg p-3 outline-none resize-none placeholder-stone-300 leading-relaxed"
                   />
@@ -317,14 +368,25 @@ export default function InboxPage() {
                     <p className="text-xs text-stone-400">
                       {draftStatus === 'created' && 'Draft saved to Gmail ✓'}
                       {draftStatus === 'error' && 'Could not create draft — try again'}
+                      {sendStatus === 'sent' && 'Sent ✓'}
+                      {sendStatus === 'error' && 'Could not send — try again'}
                     </p>
-                    <button
-                      onClick={createDraft}
-                      disabled={!reply.trim() || draftStatus === 'creating'}
-                      className="text-xs bg-teal-500 text-white font-medium px-3 py-1.5 rounded-lg hover:bg-teal-600 disabled:bg-stone-200 disabled:text-stone-400 transition"
-                    >
-                      {draftStatus === 'creating' ? 'creating...' : 'create Gmail draft'}
-                    </button>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={createDraft}
+                        disabled={!reply.trim() || draftStatus === 'creating'}
+                        className="text-xs bg-stone-100 text-stone-600 font-medium px-3 py-1.5 rounded-lg hover:bg-stone-200 disabled:bg-stone-100 disabled:text-stone-300 transition"
+                      >
+                        {draftStatus === 'creating' ? 'creating...' : 'create Gmail draft'}
+                      </button>
+                      <button
+                        onClick={sendDraft}
+                        disabled={!reply.trim() || sendStatus === 'sending' || sendStatus === 'sent'}
+                        className="text-xs bg-teal-500 text-white font-medium px-3 py-1.5 rounded-lg hover:bg-teal-600 disabled:bg-stone-200 disabled:text-stone-400 transition"
+                      >
+                        {sendStatus === 'sending' ? 'sending...' : sendStatus === 'sent' ? 'sent ✓' : 'approve & send'}
+                      </button>
+                    </div>
                   </div>
                 </div>
               </>

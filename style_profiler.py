@@ -1,10 +1,11 @@
 import json
 import re
-import sqlite3
 from typing import Optional
 from openai import OpenAI
+from psycopg2.extras import Json
 
-DB_PATH = "memory.db"
+from db import db_cursor
+
 client = OpenAI()
 
 
@@ -13,30 +14,8 @@ client = OpenAI()
 # ──────────────────────────────────────────────
 
 def init_style_table():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS style_profile (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            profile_json    TEXT NOT NULL,
-            sample_count    INTEGER DEFAULT 0,
-            updated_at      TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    # Store individual sent email samples for future re-analysis
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS sent_samples (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            gmail_id    TEXT UNIQUE,
-            body        TEXT,
-            to_email    TEXT,
-            subject     TEXT,
-            created_at  TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    conn.close()
+    """No-op — tables are created by supabase/schema.sql."""
+    pass
 
 
 # ──────────────────────────────────────────────
@@ -149,39 +128,91 @@ Return only valid JSON. No explanation, no markdown.
 
 
 # ──────────────────────────────────────────────
+# EXAMPLE EMAILS (raw few-shot samples)
+# ──────────────────────────────────────────────
+
+# How many raw sent emails to store/inject as few-shot examples.
+EXAMPLE_EMAIL_COUNT = 5
+
+def anonymize_recipient_name(body: str, to_header: str) -> str:
+    """Replace the recipient's first name (from the 'To' header display name,
+    if present) with '[Name]' wherever it appears in the body."""
+    match = re.match(r'^\s*"?([^"<]+?)"?\s*<', to_header or "")
+    if not match:
+        return body
+
+    full_name = match.group(1).strip()
+    if not full_name:
+        return body
+
+    first_name = full_name.split()[0]
+    if len(first_name) <= 1:
+        return body
+
+    return re.sub(r'\b' + re.escape(first_name) + r'\b', '[Name]', body, flags=re.IGNORECASE)
+
+
+def select_example_emails(sent: list[dict], limit: int = EXAMPLE_EMAIL_COUNT) -> list[dict]:
+    """
+    Pick a handful of representative sent emails to use as raw few-shot
+    examples, anonymizing the recipient's name in each.
+    """
+    candidates = [s for s in sent if 80 <= len(s.get("body", "")) <= 2000]
+    candidates.sort(key=lambda s: len(s["body"]), reverse=True)
+
+    examples = []
+    for s in candidates[:limit]:
+        examples.append({
+            "subject": s.get("subject", ""),
+            "body": anonymize_recipient_name(s["body"], s.get("to", s.get("to_email", ""))),
+        })
+    return examples
+
+
+# ──────────────────────────────────────────────
 # SAVE / LOAD PROFILE
 # ──────────────────────────────────────────────
 
-def save_style_profile(profile: dict, sample_count: int):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("DELETE FROM style_profile")  # single-row table
-    c.execute("""
-        INSERT INTO style_profile (profile_json, sample_count, updated_at)
-        VALUES (?, ?, CURRENT_TIMESTAMP)
-    """, (json.dumps(profile), sample_count))
-    conn.commit()
-    conn.close()
+def save_style_profile(user_id: str, profile: dict, sample_count: int, example_emails: Optional[list] = None):
+    with db_cursor(commit=True) as cur:
+        cur.execute("DELETE FROM style_profile WHERE user_id = %s", (user_id,))
+        cur.execute("""
+            INSERT INTO style_profile (user_id, profile_json, sample_count, example_emails, updated_at)
+            VALUES (%s, %s, %s, %s, now())
+        """, (user_id, Json(profile), sample_count, Json(example_emails or [])))
 
 
-def load_style_profile() -> Optional[dict]:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM style_profile ORDER BY updated_at DESC LIMIT 1")
-    row = c.fetchone()
-    conn.close()
-    if row:
-        return json.loads(row["profile_json"])
-    return None
+def get_example_emails(user_id: str, limit: int = EXAMPLE_EMAIL_COUNT) -> list[dict]:
+    """Return raw example sent emails [{subject, body}, ...] for few-shot prompts."""
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT example_emails FROM style_profile WHERE user_id = %s ORDER BY updated_at DESC LIMIT 1",
+            (user_id,)
+        )
+        row = cur.fetchone()
+
+    if not row or not row[0]:
+        return []
+
+    return row[0][:limit]
 
 
-def get_style_prompt() -> str:
+def load_style_profile(user_id: str) -> Optional[dict]:
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT profile_json FROM style_profile WHERE user_id = %s ORDER BY updated_at DESC LIMIT 1",
+            (user_id,)
+        )
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
+def get_style_prompt(user_id: str) -> str:
     """
     Returns the system-prompt snippet to inject into generation calls.
     Falls back to a sensible default if profile hasn't been built yet.
     """
-    profile = load_style_profile()
+    profile = load_style_profile(user_id)
     if profile:
         return profile.get(
             "system_prompt_snippet",
@@ -190,22 +221,20 @@ def get_style_prompt() -> str:
     return "Write in a clear, direct, and natural tone that sounds human."
 
 
-def save_sent_sample(gmail_id: str, body: str, to_email: str, subject: str):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        INSERT OR IGNORE INTO sent_samples (gmail_id, body, to_email, subject)
-        VALUES (?, ?, ?, ?)
-    """, (gmail_id, body, to_email, subject))
-    conn.commit()
-    conn.close()
+def save_sent_sample(user_id: str, gmail_id: str, body: str, to_email: str, subject: str):
+    with db_cursor(commit=True) as cur:
+        cur.execute("""
+            INSERT INTO sent_samples (user_id, gmail_id, body, to_email, subject)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (user_id, gmail_id) DO NOTHING
+        """, (user_id, gmail_id, body, to_email, subject))
 
 
 # ──────────────────────────────────────────────
 # MAIN: BUILD PROFILE
 # ──────────────────────────────────────────────
 
-def build_style_profile(service, max_samples: int = 50):
+def build_style_profile(user_id: str, service, max_samples: int = 50):
     """
     Full pipeline: fetch sent → analyze → save.
     Call this once on onboarding and periodically to keep it fresh.
@@ -220,20 +249,39 @@ def build_style_profile(service, max_samples: int = 50):
 
     # Persist samples for future re-analysis
     for s in sent:
-        save_sent_sample(s["gmail_id"], s["body"], s["to"], s["subject"])
+        save_sent_sample(user_id, s["gmail_id"], s["body"], s["to"], s["subject"])
 
     bodies = [s["body"] for s in sent]
     print("🧠 Analyzing writing style...")
     profile = analyze_style(bodies)
 
-    save_style_profile(profile, sample_count=len(sent))
-    print(f"✔ Style profile saved ({len(sent)} samples)")
+    examples = select_example_emails(sent)
+    save_style_profile(user_id, profile, sample_count=len(sent), example_emails=examples)
+    print(f"✔ Style profile saved ({len(sent)} samples, {len(examples)} few-shot examples)")
     print(f"\n📝 Your voice:\n{profile.get('system_prompt_snippet', '')}\n")
     return profile
 
 
-if __name__ == "__main__":
-    init_style_table()
-    from gmail_utils import get_gmail_service
-    service = get_gmail_service()
-    build_style_profile(service)
+def rebuild_example_emails_from_samples(user_id: str, limit: int = EXAMPLE_EMAIL_COUNT) -> list[dict]:
+    """
+    Re-select few-shot example emails from already-fetched sent_samples,
+    without hitting the Gmail API. Preserves the existing style profile
+    and sample_count, only refreshing example_emails.
+    """
+    with db_cursor(dict_rows=True) as cur:
+        cur.execute("SELECT body, to_email, subject FROM sent_samples WHERE user_id = %s", (user_id,))
+        rows = [dict(r) for r in cur.fetchall()]
+        cur.execute(
+            "SELECT profile_json, sample_count FROM style_profile WHERE user_id = %s ORDER BY updated_at DESC LIMIT 1",
+            (user_id,)
+        )
+        profile_row = cur.fetchone()
+
+    sent = [{"body": r["body"], "to": r["to_email"], "subject": r["subject"]} for r in rows]
+    examples = select_example_emails(sent, limit=limit)
+
+    profile = profile_row["profile_json"] if profile_row else {}
+    sample_count = profile_row["sample_count"] if profile_row else len(sent)
+
+    save_style_profile(user_id, profile, sample_count=sample_count, example_emails=examples)
+    return examples

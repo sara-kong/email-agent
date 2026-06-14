@@ -128,6 +128,7 @@ def fetch_full_email(service, gmail_id: str) -> dict:
         "snippet": snippet,
         "full_body": full_body,
         "email_text": email_text,
+        "internal_date": msg.get("internalDate"),
     }
 
 

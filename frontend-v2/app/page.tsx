@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react'
 import { shortName, initials, badgeColors, avatarColors } from '@/lib/email'
+import { apiFetch } from '@/lib/api'
 
 const API = '/api'
 
@@ -16,9 +17,9 @@ export default function Dashboard() {
 
   useEffect(() => {
     Promise.all([
-      fetch(`${API}/analytics/overview`).then(r => r.json()),
-      fetch(`${API}/inbox/emails?limit=8`).then(r => r.json()),
-      fetch(`${API}/contacts?limit=6`).then(r => r.json()),
+      apiFetch(`${API}/analytics/overview`).then(r => r.json()),
+      apiFetch(`${API}/inbox/emails?limit=8`).then(r => r.json()),
+      apiFetch(`${API}/contacts?limit=6`).then(r => r.json()),
     ]).then(([a, e, c]) => {
       setAnalytics(a)
       setEmails(e.emails || [])
@@ -31,7 +32,7 @@ export default function Dashboard() {
     if (!agentInput.trim()) return
     setAgentLoading(true)
     setAgentResponse('')
-    const res = await fetch(`${API}/agent/chat`, {
+    const res = await apiFetch(`${API}/agent/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ message: agentInput })

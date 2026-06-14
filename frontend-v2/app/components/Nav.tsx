@@ -2,6 +2,7 @@
 
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
+import { useAuth } from './AuthProvider'
 
 const links = [
   { href: '/', label: 'Dashboard' },
@@ -11,6 +12,9 @@ const links = [
 
 export default function Nav() {
   const pathname = usePathname()
+  const { user, logout } = useAuth()
+
+  if (pathname === '/login') return null
 
   return (
     <div className="border-b border-stone-100 bg-white">
@@ -29,6 +33,18 @@ export default function Nav() {
             {l.label}
           </Link>
         ))}
+        <div className="flex-1" />
+        {user && (
+          <div className="flex items-center gap-3">
+            <span className="text-xs text-stone-400">{user.email}</span>
+            <button
+              onClick={logout}
+              className="text-xs text-stone-400 hover:text-stone-600 px-2 py-1 rounded-lg transition"
+            >
+              Sign out
+            </button>
+          </div>
+        )}
       </div>
     </div>
   )
